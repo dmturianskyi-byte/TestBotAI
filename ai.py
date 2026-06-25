@@ -4,6 +4,9 @@ from tools import search_pharmacies
 from prompts import SYSTEM_PROMPT
 
 
+client = ollama.Client(host="http://ollama:11434")
+
+
 TOOLS = [
     {
         "type": "function",
@@ -91,7 +94,7 @@ def ask_ai(user_text: str) -> str:
     print(f"\n{'='*50}")
     print(f"[AI] Запит: {user_text}")
 
-    response = ollama.chat(
+    response = client.chat(
         model="qwen3:8b",
         messages=messages,
         tools=TOOLS
@@ -119,7 +122,7 @@ def ask_ai(user_text: str) -> str:
 
     print(f"[AI] Генерую відповідь на основі {len(tool_results)} результатів...")
 
-    final = ollama.chat(
+    final = client.chat(
         model="qwen3:8b",
         messages=messages
     )
