@@ -123,7 +123,8 @@ def ask_ai(user_text: str) -> str:
     print(f"[AI] Генерую відповідь на основі {len(tool_results)} результатів...")
 
     final = client.chat(
-        model="qwen3:8b",
+        #model="qwen3:8b", - поки вимкнув, довго думає
+        model="qwen3:1.7b",
         messages=messages
     )
 
