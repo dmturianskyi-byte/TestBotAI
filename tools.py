@@ -2,6 +2,8 @@ from db import get_cursor
 from model import model
 from geocoder import geocode
 
+AGGREGATE_THRESHOLD = 300  # якщо результатів більше — агрегуємо замість повного списку
+
 
 def search_pharmacies(
     query: str = None,
@@ -10,34 +12,33 @@ def search_pharmacies(
     radius: int = 1000,
     count_only: bool = False,
     group_by_city: bool = False,
-    limit: int = 20,
+    limit: int = None,
 ):
-    """
-    Універсальний пошук аптек.
-
-    query        — назва/опис для семантичного пошуку (опціонально)
-    city         — назва міста для фільтрації (опціонально)
-    address      — конкретна адреса для geo-пошуку (опціонально, геокодиться)
-    radius       — радіус у метрах, використовується тільки якщо передано address
-    count_only   — якщо True, повертає тільки кількість
-    group_by_city— якщо True, повертає статистику по містах (топ міст)
-    limit        — максимум результатів
-    """
-
     cur = get_cursor()
 
-    # ---- Статистика по містах ----
+    if query and address and not city:
+        print(f"[SEARCH] ⚠️ query='{query}' + address одночасно — ігнорую query")
+        query = None
+
     if group_by_city:
-        cur.execute("""
-            SELECT name_city, COUNT(*) as count
-            FROM competitors_tabletki_firms
-            GROUP BY name_city
-            ORDER BY count DESC
-            LIMIT %s
-        """, (limit,))
+        if limit:
+            cur.execute("""
+                SELECT name_city, COUNT(*) as count
+                FROM competitors_tabletki_firms
+                GROUP BY name_city
+                ORDER BY count DESC
+                LIMIT %s
+            """, (limit,))
+        else:
+            cur.execute("""
+                SELECT name_city, COUNT(*) as count
+                FROM competitors_tabletki_firms
+                GROUP BY name_city
+                ORDER BY count DESC
+            """)
         rows = cur.fetchall()
-        print(f"[SEARCH] group_by_city → {len(rows)} міст")
-        return rows
+        print(f"[SEARCH] group_by_city → {len(rows)} міст (limit={limit})")
+        return [{"city": r[0], "count": r[1]} for r in rows]
 
     where_clauses = []
     params = []
@@ -51,11 +52,10 @@ def search_pharmacies(
         coords = geocode(address)
         if not coords:
             print(f"[SEARCH] ❌ Координати не знайдено для адреси: {address}")
-            return [] if not count_only else 0
+            return 0 if count_only else []
         lat, lon = coords
         print(f"[SEARCH] Адреса '{address}' → lat={lat}, lon={lon}")
 
-    # ---- Будуємо WHERE динамічно ----
     if city:
         where_clauses.append("LOWER(name_city) LIKE LOWER(%s)")
         params.append(f"%{city}%")
@@ -74,7 +74,6 @@ def search_pharmacies(
         word_count = len(query.split())
         threshold = 0.45 if word_count <= 2 else 0.6
 
-        # ДЕБАГ — подивимось топ-5 схожості незалежно від порогу
         cur.execute("""
             SELECT name, 1 - (embedding <=> %s::vector) AS sim
             FROM competitors_tabletki_firms
@@ -94,31 +93,89 @@ def search_pharmacies(
 
     where_sql = " AND ".join(where_clauses) if where_clauses else "TRUE"
 
-    # ---- COUNT ----
     if count_only:
-        sql = f"""
-            SELECT COUNT(*) FROM competitors_tabletki_firms
-            WHERE {where_sql}
-        """
+        sql = f"SELECT COUNT(*) FROM competitors_tabletki_firms WHERE {where_sql}"
         print(f"[DEBUG SQL] {sql}")
-        print(f"[DEBUG PARAMS] {params}")
         cur.execute(sql, params)
         result = cur.fetchone()[0]
-        print(f"[SEARCH] COUNT query='{query}' city='{city}' address='{address}' → {result}")
+        print(f"[SEARCH] COUNT → {result}")
         return result
 
-    # ---- LIST (з сортуванням по similarity якщо є query, інакше по distance) ----
+    # ---- Спочатку рахуємо загальну кількість, щоб вирішити: список чи агрегація ----
+    count_sql = f"SELECT COUNT(*) FROM competitors_tabletki_firms WHERE {where_sql}"
+    cur.execute(count_sql, params)
+    total_count = cur.fetchone()[0]
+
     order_sql = "ORDER BY embedding <=> %s::vector" if query else "ORDER BY name"
     order_params = [emb] if query else []
 
-    sql = f"""
+    # ---- Якщо користувач сам попросив limit — завжди повертаємо звичайний список ----
+    if limit:
+        sql = f"""
+            SELECT name, address, name_city
+            FROM competitors_tabletki_firms
+            WHERE {where_sql}
+            {order_sql}
+            LIMIT %s
+        """
+        cur.execute(sql, params + order_params + [limit])
+        rows = cur.fetchall()
+        print(f"[SEARCH] LIST (limit={limit}) → {len(rows)} результатів")
+        return [{"name": r[0], "address": r[1], "city": r[2]} for r in rows]
+
+    # ---- Без limit і результатів МАЛО — повний список ----
+    if total_count <= AGGREGATE_THRESHOLD:
+        sql = f"""
+            SELECT name, address, name_city
+            FROM competitors_tabletki_firms
+            WHERE {where_sql}
+            {order_sql}
+        """
+        cur.execute(sql, params + order_params)
+        rows = cur.fetchall()
+        print(f"[SEARCH] LIST (full) → {len(rows)} результатів")
+        return [{"name": r[0], "address": r[1], "city": r[2]} for r in rows]
+
+    # ---- Без limit і результатів БАГАТО — агрегуємо по вулицях ----
+    print(f"[SEARCH] ⚠️ {total_count} результатів > {AGGREGATE_THRESHOLD} — агрегую по вулицях")
+
+    street_sql = f"""
+        SELECT
+            split_part(address, ',', 1) AS street,
+            name_city,
+            COUNT(*) AS count
+        FROM competitors_tabletki_firms
+        WHERE {where_sql}
+        GROUP BY street, name_city
+        ORDER BY count DESC
+    """
+    cur.execute(street_sql, params)
+    street_rows = cur.fetchall()
+
+    # Невелика вибірка конкретних прикладів (для перевірки/посилань моделлю)
+    sample_sql = f"""
         SELECT name, address, name_city
         FROM competitors_tabletki_firms
         WHERE {where_sql}
         {order_sql}
-        LIMIT %s
+        LIMIT 30
     """
-    cur.execute(sql, params + order_params + [limit])
-    rows = cur.fetchall()
-    print(f"[SEARCH] LIST query='{query}' city='{city}' address='{address}' → {len(rows)} результатів")
-    return rows
+    cur.execute(sample_sql, params + order_params)
+    sample_rows = cur.fetchall()
+
+    return {
+        "total_count": total_count,
+        "aggregated": True,
+        "note": (
+            f"Знайдено {total_count} аптек — повний список занадто великий, "
+            f"тому дані згруповано по вулицях/районах."
+        ),
+        "by_street": [
+            {"street": r[0].strip(), "city": r[1], "count": r[2]}
+            for r in street_rows
+        ],
+        "sample_pharmacies": [
+            {"name": r[0], "address": r[1], "city": r[2]}
+            for r in sample_rows
+        ],
+    }
